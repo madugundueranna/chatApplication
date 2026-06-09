@@ -52,7 +52,7 @@ const serializeMessage = (msg, conversationId, userIdMap) => ({
 });
 
 // Shared by REST `POST /messages` and the socket `message:send` handler.
-// `conversationId` is the readable id (CvE-XXXXXX).
+// `conversationId` is the readable id (CVE-XXXXXX).
 export const createAndDispatchMessage = async ({ conversationId, senderId, content, type }) => {
   const conversation = await loadParticipantConversation({ conversationId }, senderId);
 

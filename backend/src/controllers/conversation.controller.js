@@ -1,3 +1,18 @@
+/**
+ * Conversation controller
+ *
+ * Handles the lifecycle of direct (1:1) and group conversations:
+ *   - createConversation : start a direct chat (deduped — returns the existing
+ *                          one if it already exists) or create a named group.
+ *   - listConversations  : return the caller's conversations, served from cache.
+ *   - getConversation    : fetch one conversation by id (participants only).
+ *   - deleteConversation  : leave a group (or delete it once empty), or delete a
+ *                          direct conversation outright.
+ *
+ * Participant access is enforced via ensureParticipant, readable userIds are
+ * resolved to internal _ids before persistence, and any write invalidates the
+ * cached conversation list for every affected participant.
+ */
 import Conversation from '../models/Conversation.js';
 import User from '../models/User.js';
 import asyncHandler from '../utils/asyncHandler.js';

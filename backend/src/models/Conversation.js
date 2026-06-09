@@ -5,7 +5,7 @@ import hideObjectId from '../utils/hideObjectId.js';
 
 const conversationSchema = new mongoose.Schema(
   {
-    // Public-facing identifier (CvE-XXXXXX).
+    // Public-facing identifier (CVE-XXXXXX).
     conversationId: { type: String, required: true, unique: true, immutable: true },
     type: {
       type: String,

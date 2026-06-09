@@ -12,13 +12,12 @@ const generateRandomString = (prefix, length = 6) => {
   return result;
 };
 
-//* Public-facing identifiers (Mongo's _id stays the internal primary key).
 
 //* Generate a User ID -> USR-XXXXXX
 const generateUserId = () => generateRandomString("USR");
 
-//* Generate a Conversation ID -> CvE-XXXXXX
-const generateConversationId = () => generateRandomString("CvE");
+//* Generate a Conversation ID -> CVE-XXXXXX
+const generateConversationId = () => generateRandomString("CVE");
 
 //* Generate a Message ID -> MSG-XXXXXX
 const generateMessageId = () => generateRandomString("MSG");

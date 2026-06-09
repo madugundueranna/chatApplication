@@ -4,7 +4,7 @@ import { SOCKET_EVENTS, CACHE_KEYS } from '../../common/Constants.js';
 
 const THROTTLE_SECONDS = 2;
 
-// conversationId is the readable id (CvE-XXXXXX) sent by the client; senderId is
+// conversationId is the readable id (CVE-XXXXXX) sent by the client; senderId is
 // the internal _id used for membership checks and socket-room routing.
 const emitToOthers = async (io, conversationId, senderId, event, payload) => {
   const conversation = await Conversation.findOne({ conversationId })

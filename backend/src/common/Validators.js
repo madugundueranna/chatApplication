@@ -5,7 +5,7 @@ const email = () => body('email').isEmail().withMessage('A valid email is requir
 const password = () =>
   body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters');
 
-// Readable public ids look like USR-A1B2C3 / CvE-... / MSG-... (prefix + 6 chars).
+// Readable public ids look like USR-A1B2C3 / CVE-... / MSG-... (prefix + 6 chars).
 const readableId = (prefix) => new RegExp(`^${prefix}-[A-Z0-9]{6}$`);
 const readableParam = (name, prefix, label) =>
   param(name).matches(readableId(prefix)).withMessage(`A valid ${label} is required`);
@@ -57,20 +57,20 @@ export const createConversationValidator = [
   body('name').optional().trim().notEmpty().withMessage('Group name cannot be empty'),
 ];
 
-export const conversationIdParam = [readableParam('conversationId', 'CvE', 'conversation id')];
+export const conversationIdParam = [readableParam('conversationId', 'CVE', 'conversation id')];
 
 export const sendMessageValidator = [
-  readableBody('conversationId', 'CvE', 'conversationId'),
+  readableBody('conversationId', 'CVE', 'conversationId'),
   body('content').trim().notEmpty().withMessage('Message content is required'),
   body('type').optional().isIn(Object.values(MESSAGE_TYPES)),
 ];
 
 export const messageHistoryValidator = [
-  readableParam('conversationId', 'CvE', 'conversationId'),
+  readableParam('conversationId', 'CVE', 'conversationId'),
   query('cursor').optional().isMongoId().withMessage('cursor must be a valid id'),
   query('limit').optional().isInt({ min: 1, max: 100 }).toInt(),
 ];
 
 export const messageIdParam = [readableParam('messageId', 'MSG', 'message id')];
 
-export const markManyReadValidator = [readableParam('conversationId', 'CvE', 'conversationId')];
+export const markManyReadValidator = [readableParam('conversationId', 'CVE', 'conversationId')];
