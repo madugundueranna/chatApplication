@@ -37,10 +37,36 @@ export const sendOtpEmail = (to, code) => {
   return sendMail({ to, subject, html, text });
 };
 
+export const sendPasswordResetEmail = (to, code) => {
+  const minutes = Number(process.env.OTP_TTL_MINUTES) || 10;
+  return sendMail({
+    to,
+    subject: `${appName()} password reset code`,
+    text: `Your password reset code is ${code}. It expires in ${minutes} minutes. If you didn't request this, you can ignore this email.`,
+    html: `<p>Your ${appName()} password reset code is <strong style="font-size:18px;letter-spacing:2px">${code}</strong>.</p><p>It expires in ${minutes} minutes. If you didn't request this, you can safely ignore this email.</p>`,
+  });
+};
+
 export const sendNewMessageEmail = (to, senderName) =>
   sendMail({
     to,
     subject: 'New message',
     text: `You have a new message from ${senderName}.`,
     html: `<p>You have a new message from <strong>${senderName}</strong>.</p>`,
+  });
+
+export const sendIncomingCallEmail = (to, callerName, type) =>
+  sendMail({
+    to,
+    subject: `Incoming ${type} call`,
+    text: `${callerName} is calling you (${type}).`,
+    html: `<p><strong>${callerName}</strong> is calling you (${type}).</p>`,
+  });
+
+export const sendMissedCallEmail = (to, callerName, type) =>
+  sendMail({
+    to,
+    subject: `Missed ${type} call`,
+    text: `You missed a ${type} call from ${callerName}.`,
+    html: `<p>You missed a ${type} call from <strong>${callerName}</strong>.</p>`,
   });

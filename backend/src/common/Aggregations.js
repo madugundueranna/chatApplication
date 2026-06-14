@@ -1,12 +1,12 @@
-import mongoose from 'mongoose';
-
-const toId = (id) => new mongoose.Types.ObjectId(id);
+// Cross-model references are stored as public ids now (USR-/CVE-/MSG-), so every
+// join below matches on the readable id field (userId/conversationId/messageId),
+// not on Mongo's _id.
 
 // Unread = messages in this conversation not sent by me and not yet in my readBy.
 const unreadCountStage = (userId) => ({
   $lookup: {
     from: 'messages',
-    let: { convId: '$_id' },
+    let: { convId: '$conversationId' },
     pipeline: [
       {
         $match: {
@@ -14,8 +14,8 @@ const unreadCountStage = (userId) => ({
             $and: [
               { $eq: ['$conversation', '$$convId'] },
               { $eq: ['$isDeleted', false] },
-              { $ne: ['$sender', toId(userId)] },
-              { $not: [{ $in: [toId(userId), '$readBy'] }] },
+              { $ne: ['$sender', userId] },
+              { $not: [{ $in: [userId, '$readBy'] }] },
             ],
           },
         },
@@ -35,7 +35,7 @@ const otherParticipantsStage = (userId) => ({
       {
         $match: {
           $expr: {
-            $and: [{ $in: ['$_id', '$$parts'] }, { $ne: ['$_id', toId(userId)] }],
+            $and: [{ $in: ['$userId', '$$parts'] }, { $ne: ['$userId', userId] }],
           },
         },
       },
@@ -46,23 +46,23 @@ const otherParticipantsStage = (userId) => ({
 });
 
 export const conversationListPipeline = (userId) => [
-  { $match: { participants: toId(userId) } },
+  { $match: { participants: userId } },
   { $sort: { updatedAt: -1 } },
   {
     $lookup: {
       from: 'messages',
-      localField: 'lastMessage',
-      foreignField: '_id',
+      localField: 'lastMessage', // MSG-XXXXXX
+      foreignField: 'messageId',
       as: 'lastMessage',
     },
   },
   { $unwind: { path: '$lastMessage', preserveNullAndEmptyArrays: true } },
-  // Resolve the last message's sender to its readable userId.
+  // Resolve the last message's sender (a userId) to its public preview fields.
   {
     $lookup: {
       from: 'users',
-      localField: 'lastMessage.sender',
-      foreignField: '_id',
+      localField: 'lastMessage.sender', // USR-XXXXXX
+      foreignField: 'userId',
       as: 'lastMessageSender',
     },
   },
@@ -79,7 +79,7 @@ export const conversationListPipeline = (userId) => [
       otherParticipants: 1,
       lastMessage: {
         $cond: [
-          { $ifNull: ['$lastMessage._id', false] },
+          { $ifNull: ['$lastMessage.messageId', false] },
           {
             messageId: '$lastMessage.messageId',
             content: '$lastMessage.content',
@@ -91,6 +91,16 @@ export const conversationListPipeline = (userId) => [
         ],
       },
       unreadCount: { $ifNull: [{ $arrayElemAt: ['$unread.count', 0] }, 0] },
+      // This viewer's mute flag, read from their participantStates entry.
+      muted: {
+        $anyElementTrue: {
+          $map: {
+            input: { $ifNull: ['$participantStates', []] },
+            as: 's',
+            in: { $and: [{ $eq: ['$$s.userId', userId] }, { $eq: ['$$s.muted', true] }] },
+          },
+        },
+      },
     },
   },
 ];
@@ -98,7 +108,7 @@ export const conversationListPipeline = (userId) => [
 export const userSearchPipeline = (q, meId, limit = 20) => [
   {
     $match: {
-      _id: { $ne: toId(meId) },
+      userId: { $ne: meId },
       isVerified: true,
       $or: [
         { name: { $regex: q, $options: 'i' } },
@@ -111,7 +121,7 @@ export const userSearchPipeline = (q, meId, limit = 20) => [
 ];
 
 export const conversationStatsPipeline = (conversationId, userId) => [
-  { $match: { conversation: toId(conversationId), isDeleted: false } },
+  { $match: { conversation: conversationId, isDeleted: false } },
   {
     $group: {
       _id: '$conversation',
@@ -121,8 +131,8 @@ export const conversationStatsPipeline = (conversationId, userId) => [
           $cond: [
             {
               $and: [
-                { $ne: ['$sender', toId(userId)] },
-                { $not: [{ $in: [toId(userId), '$readBy'] }] },
+                { $ne: ['$sender', userId] },
+                { $not: [{ $in: [userId, '$readBy'] }] },
               ],
             },
             1,

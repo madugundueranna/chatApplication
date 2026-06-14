@@ -86,7 +86,8 @@ const buildUsers = async () => {
 const buildConversations = (users) => {
   const directCount = Math.round(CONVERSATIONS * DIRECT_RATIO);
   const groupCount = CONVERSATIONS - directCount;
-  const ids = users.map((u) => u._id);
+  // Refs are stored as public ids now (USR-XXXXXX), not _id.
+  const ids = users.map((u) => u.userId);
   const convs = [];
 
   // Direct: unique unordered pairs, no self-pairs, no duplicates.
@@ -170,15 +171,15 @@ const buildMessages = (conversations) => {
 
       docs.push({
         messageId: nextMessageId(),
-        conversation: conv._id,
-        sender,
+        conversation: conv.conversationId, // CVE-XXXXXX
+        sender, // USR-XXXXXX
         ...buildMessageContent(),
-        readBy,
+        readBy, // USR-XXXXXX[]
         isDeleted: false,
         createdAt,
         updatedAt: createdAt,
       });
-      lastIndexByConv[String(conv._id)] = docs.length - 1;
+      lastIndexByConv[conv.conversationId] = docs.length - 1;
     }
   }
 
@@ -214,11 +215,11 @@ const run = async () => {
 
   // Point each conversation at its newest message and bump updatedAt to match.
   const ops = convDocs.map((conv) => {
-    const newest = messageDocs[lastIndexByConv[String(conv._id)]];
+    const newest = messageDocs[lastIndexByConv[conv.conversationId]];
     return {
       updateOne: {
         filter: { _id: conv._id },
-        update: { $set: { lastMessage: newest._id, updatedAt: newest.createdAt } },
+        update: { $set: { lastMessage: newest.messageId, updatedAt: newest.createdAt } },
         timestamps: false,
       },
     };

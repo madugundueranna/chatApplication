@@ -6,6 +6,7 @@ import socketAuth from './socketAuth.js';
 import registerPresenceHandlers from './handlers/presence.handler.js';
 import registerMessageHandlers from './handlers/message.handler.js';
 import registerTypingHandlers from './handlers/typing.handler.js';
+import registerCallHandlers from './handlers/call.handler.js';
 
 let io;
 
@@ -22,6 +23,7 @@ export const initSocket = (httpServer) => {
     registerPresenceHandlers(io, socket);
     registerMessageHandlers(io, socket);
     registerTypingHandlers(io, socket);
+    registerCallHandlers(io, socket);
   });
 
   return io;

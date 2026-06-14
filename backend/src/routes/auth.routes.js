@@ -7,6 +7,8 @@ import {
   resendOtpValidator,
   refreshValidator,
   logoutValidator,
+  forgotPasswordValidator,
+  resetPasswordValidator,
 } from '../common/Validators.js';
 import {
   register,
@@ -15,6 +17,8 @@ import {
   login,
   refresh,
   logout,
+  forgotPassword,
+  resetPassword,
 } from '../controllers/auth.controller.js';
 
 const router = Router();
@@ -25,5 +29,7 @@ router.post('/resend-otp', resendOtpValidator, validate, resendOtp);
 router.post('/login', loginValidator, validate, login);
 router.post('/refresh', refreshValidator, validate, refresh);
 router.post('/logout', logoutValidator, validate, logout);
+router.post('/forgot-password', forgotPasswordValidator, validate, forgotPassword);
+router.post('/reset-password', resetPasswordValidator, validate, resetPassword);
 
 export default router;

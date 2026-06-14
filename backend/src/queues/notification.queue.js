@@ -1,19 +1,50 @@
 import { Worker } from 'bullmq';
 import { bullConnection, attachErrorLogger } from '../config/redis.js';
 import { notificationQueue, QUEUE_NAMES } from './index.js';
-import { sendOtpEmail, sendNewMessageEmail } from '../services/email.service.js';
+import {
+  sendOtpEmail,
+  sendPasswordResetEmail,
+  sendNewMessageEmail,
+  sendIncomingCallEmail,
+  sendMissedCallEmail,
+} from '../services/email.service.js';
+import { sendPushToUser } from '../services/push.service.js';
 
-export const JOBS = { OTP_EMAIL: 'otp-email', NEW_MESSAGE: 'new-message' };
+export const JOBS = {
+  OTP_EMAIL: 'otp-email',
+  PASSWORD_RESET: 'password-reset',
+  NEW_MESSAGE: 'new-message',
+  INCOMING_CALL: 'incoming-call',
+  MISSED_CALL: 'missed-call',
+  PUSH_NOTIFICATION: 'push-notification',
+};
 
 // Producers — enqueue only, never await the heavy work.
 export const enqueueOtpEmail = (email, code) => notificationQueue.add(JOBS.OTP_EMAIL, { email, code });
 
+export const enqueuePasswordResetEmail = (email, code) =>
+  notificationQueue.add(JOBS.PASSWORD_RESET, { email, code });
+
 export const enqueueNewMessage = (payload) => notificationQueue.add(JOBS.NEW_MESSAGE, payload);
+
+export const enqueueIncomingCall = (payload) => notificationQueue.add(JOBS.INCOMING_CALL, payload);
+
+export const enqueueMissedCall = (payload) => notificationQueue.add(JOBS.MISSED_CALL, payload);
+
+// Deliver an Expo device push to one user (their registered tokens).
+export const enqueuePushNotification = (payload) =>
+  notificationQueue.add(JOBS.PUSH_NOTIFICATION, payload);
 
 const processors = {
   [JOBS.OTP_EMAIL]: ({ email, code }) => sendOtpEmail(email, code),
+  [JOBS.PASSWORD_RESET]: ({ email, code }) => sendPasswordResetEmail(email, code),
   [JOBS.NEW_MESSAGE]: ({ recipients, senderName }) =>
     Promise.all(recipients.map((to) => sendNewMessageEmail(to, senderName))),
+  [JOBS.INCOMING_CALL]: ({ email, callerName, type }) =>
+    sendIncomingCallEmail(email, callerName, type),
+  [JOBS.MISSED_CALL]: ({ email, callerName, type }) => sendMissedCallEmail(email, callerName, type),
+  [JOBS.PUSH_NOTIFICATION]: ({ userId, title, body, data }) =>
+    sendPushToUser(userId, { title, body, data }),
 };
 
 export const startNotificationWorker = () => {

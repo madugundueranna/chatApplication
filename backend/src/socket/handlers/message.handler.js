@@ -4,7 +4,7 @@ import { createAndDispatchMessage } from '../../controllers/message.controller.j
 import { SOCKET_EVENTS } from '../../common/Constants.js';
 
 const registerMessageHandlers = (io, socket) => {
-  const userId = socket.user.id;
+  const userId = socket.user.userId; // public id: refs, membership checks, socket rooms
 
   socket.on(SOCKET_EVENTS.MESSAGE_SEND, async (data, ack) => {
     try {
@@ -26,17 +26,18 @@ const registerMessageHandlers = (io, socket) => {
         'conversation messageId'
       );
       if (!message) return;
-      const conversation = await Conversation.findById(message.conversation)
+      // message.conversation is now the readable conversationId (CVE-XXXXXX).
+      const conversation = await Conversation.findOne({ conversationId: message.conversation })
         .select('participants conversationId')
         .lean();
-      if (!conversation?.participants.some((p) => String(p) === String(userId))) return;
+      if (!conversation?.participants.some((p) => p === userId)) return;
 
-      await Message.updateOne({ _id: message._id }, { $addToSet: { readBy: userId } });
+      await Message.updateOne({ messageId: message.messageId }, { $addToSet: { readBy: userId } });
       conversation.participants.forEach((p) =>
-        io.to(String(p)).emit(SOCKET_EVENTS.MESSAGE_READ, {
+        io.to(p).emit(SOCKET_EVENTS.MESSAGE_READ, {
           messageId: message.messageId,
           conversationId: conversation.conversationId,
-          userId: socket.user.userId,
+          userId,
         })
       );
     } catch {

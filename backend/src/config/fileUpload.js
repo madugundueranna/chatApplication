@@ -1,23 +1,29 @@
-const multer = require("multer");
+// Multer config for in-memory media uploads (status photos/videos). Files are held
+// in memory and streamed on to Cloudinary, so nothing touches local disk.
+import multer from 'multer';
 
-const storage = multer.memoryStorage();
-
-const fileFilter = (req, file, cb) => {
-  const allowedMimeTypes = ["image/png", "image/jpg", "image/jpeg"];
-
-  if (allowedMimeTypes.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error("Only .png, .jpg, and .jpeg formats are allowed"), false);
-  }
-};
+const ALLOWED_MIME = [
+  // images
+  'image/png',
+  'image/jpg',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+  // videos
+  'video/mp4',
+  'video/quicktime',
+  'video/webm',
+  'video/x-matroska',
+  'video/3gpp',
+];
 
 const upload = multer({
-  storage: storage,
-  fileFilter: fileFilter,
-  limits: {
-    fileSize: 1024 * 1024 * 30, // 30 MB
-  },
+  storage: multer.memoryStorage(),
+  fileFilter: (_req, file, cb) =>
+    ALLOWED_MIME.includes(file.mimetype)
+      ? cb(null, true)
+      : cb(new Error('Only image and video files are allowed')),
+  limits: { fileSize: 1024 * 1024 * 50 }, // 50 MB
 });
 
-module.exports = upload;
+export default upload;

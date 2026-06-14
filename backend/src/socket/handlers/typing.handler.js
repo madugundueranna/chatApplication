@@ -5,20 +5,19 @@ import { SOCKET_EVENTS, CACHE_KEYS } from '../../common/Constants.js';
 const THROTTLE_SECONDS = 2;
 
 // conversationId is the readable id (CVE-XXXXXX) sent by the client; senderId is
-// the internal _id used for membership checks and socket-room routing.
+// the public userId used for membership checks and socket-room routing.
 const emitToOthers = async (io, conversationId, senderId, event, payload) => {
   const conversation = await Conversation.findOne({ conversationId })
     .select('participants')
     .lean();
-  if (!conversation?.participants.some((p) => String(p) === String(senderId))) return;
+  if (!conversation?.participants.some((p) => p === senderId)) return;
   conversation.participants
-    .map(String)
-    .filter((id) => id !== String(senderId))
+    .filter((id) => id !== senderId)
     .forEach((id) => io.to(id).emit(event, payload));
 };
 
 const registerTypingHandlers = (io, socket) => {
-  const userId = socket.user.id; // internal _id
+  const userId = socket.user.userId; // public id: membership, rooms, throttle key
   const publicUserId = socket.user.userId; // readable id for payloads
 
   socket.on(SOCKET_EVENTS.TYPING_START, async ({ conversationId } = {}) => {

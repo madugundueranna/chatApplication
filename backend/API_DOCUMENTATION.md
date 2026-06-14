@@ -177,9 +177,13 @@ Copy `.env.example` → `.env` and fill in values.
 | `SMTP_USER` | yes (for email) | `you@gmail.com` | SMTP username |
 | `SMTP_PASS` | yes (for email) | (app password) | SMTP password / Gmail App Password |
 | `SMTP_FROM` | yes (for email) | `Chat App <you@gmail.com>` | From header (Gmail rewrites to the authenticated user) |
+| `CLOUDINARY_CLOUD_NAME` | yes (for uploads) | `your_cloud_name` | Cloudinary account — file/image messages, status media & avatars stream here |
+| `CLOUDINARY_API_KEY` | yes (for uploads) | `your_api_key` | Cloudinary API key |
+| `CLOUDINARY_API_SECRET` | yes (for uploads) | `your_api_secret` | Cloudinary API secret (server-side only) |
 
-> `CLOUDINARY_*` / `GOOGLE_*` keys may appear in some `.env` files but are **not used** by the
-> current code (file upload and OAuth are not implemented — see §15–17).
+> `CLOUDINARY_*` keys are **required** for uploads — file/image messages, status media and avatar
+> uploads stream to Cloudinary (see §17). `GOOGLE_*` keys may appear in some `.env` files but are
+> **not used** (OAuth is not implemented).
 
 ---
 
@@ -775,33 +779,70 @@ curl "http://localhost:5000/api/users/search?q=bob" -H "Authorization: Bearer $T
 | **Endpoint Name** | Send Message |
 | **HTTP Method** | `POST` |
 | **URL Path** | `/api/messages` |
-| **Purpose** | Create a message in a conversation |
+| **Purpose** | Create a message in a conversation (text **or** a file attachment) |
 | **Auth Required** | Yes |
 
-**Request Body Schema**
+This endpoint accepts **two content types**:
+
+- **`application/json`** — a text message (original behavior, unchanged).
+- **`multipart/form-data`** — a file message (PDF or image) sent into the conversation. It is delivered to the other participant(s) exactly like a text message (same `lastMessage` update, cache invalidation, `message:new` emit, and offline email/push).
+
+**Variant 1 — JSON text message (`Content-Type: application/json`)**
 
 | Field | Type | Required | Rules |
 |-------|------|----------|-------|
-| `conversationId` | string | yes | Valid ObjectId; requester must be a participant |
+| `conversationId` | string | yes | Readable id `CVE-XXXXXX`; requester must be a participant |
 | `content` | string | yes | Non-empty |
 | `type` | string | no | `text` (default), `image`, or `file` |
 
-**Success Response — `201 Created`**
+**Variant 2 — File message (`Content-Type: multipart/form-data`)**
+
+| Field | Type | Required | Rules |
+|-------|------|----------|-------|
+| `file` | file | yes | The binary part. PDF or image (`jpeg`, `png`, `webp`, `gif`), **≤ 10 MB**. Held in memory (multer `memoryStorage`) and streamed to Cloudinary — never written to disk. The real byte signature is re-verified (magic bytes), so a spoofed extension/mimetype is rejected. |
+| `conversationId` | string | yes | Readable id `CVE-XXXXXX`; requester must be a participant |
+| `caption` | string | no | Optional caption shown with the file (≤ 1000 chars) |
+
+For a file message the server sets `type` automatically (`image` for images, `file` for PDFs) and stores the returned secure URL as `content`; the original name, mime type, size and optional caption are saved under `attachment`.
+
+**Success Response — `201 Created`** (text message)
 ```json
 {
   "success": true,
   "message": "Message sent",
   "data": {
-    "_id": "6a2776f448722dfdf84de4fa",
-    "conversation": "6a2776f448722dfdf84de4f7",
-    "sender": "6a2776dc48722dfdf84de4e8",
+    "messageId": "MSG-A1B2C3",
+    "conversationId": "CVE-9F8E7D",
+    "sender": "USR-4D5E6F",
     "content": "Hello Bob!",
     "type": "text",
-    "readBy": ["6a2776dc48722dfdf84de4e8"],
+    "readBy": ["USR-4D5E6F"],
+    "isDeleted": false,
+    "createdAt": "2026-06-09T02:14:12.652Z"
+  }
+}
+```
+
+**Success Response — `201 Created`** (file message; `message` is `"File sent"`)
+```json
+{
+  "success": true,
+  "message": "File sent",
+  "data": {
+    "messageId": "MSG-7H8I9J",
+    "conversationId": "CVE-9F8E7D",
+    "sender": "USR-4D5E6F",
+    "content": "https://res.cloudinary.com/<cloud>/raw/upload/v1/chatloop/messages/abc123.pdf",
+    "type": "file",
+    "readBy": ["USR-4D5E6F"],
     "isDeleted": false,
     "createdAt": "2026-06-09T02:14:12.652Z",
-    "updatedAt": "2026-06-09T02:14:12.652Z",
-    "__v": 0
+    "attachment": {
+      "originalName": "invoice.pdf",
+      "mimeType": "application/pdf",
+      "size": 824133,
+      "caption": "Here's the invoice"
+    }
   }
 }
 ```
@@ -813,14 +854,16 @@ curl "http://localhost:5000/api/users/search?q=bob" -H "Authorization: Bearer $T
 | `401` | Not authenticated |
 | `403` | Not a participant of the conversation |
 | `404` | Conversation not found |
-| `422` | Validation failed |
+| `413` | File exceeds 10MB (`LIMIT_FILE_SIZE`) |
+| `415` | Disallowed or spoofed file type (only PDF + `jpeg`/`png`/`webp`/`gif`) |
+| `422` | Validation failed (e.g. missing `conversationId`, or empty `content` on a text message) |
 
 **Notes / Business Rules**
-- For `image`/`file`, `content` should be the **media URL** (upload to S3/Cloudinary first; the API stores URLs only).
-- Side effects: updates `conversation.lastMessage`, invalidates participants' conversation-list caches,
-  emits `message:new` to each other participant's user room, and **enqueues** an email notification job
-  for participants who are currently offline.
+- **Text message:** send `application/json` with `content`. **File message:** send `multipart/form-data` with a `file` part (+ `conversationId`, optional `caption`); the server uploads it and stores the resulting secure URL as `content`, with metadata under `attachment`.
+- File handling: multer `memoryStorage()` keeps the upload as an in-memory Buffer (no disk writes), capped at 10MB; the buffer is streamed to Cloudinary via `upload_stream` (`resource_type: "image"` for images, `"raw"` for PDFs). The true type is verified from the file's magic bytes — the declared mimetype/extension alone is not trusted.
+- Side effects are **identical** for text and file messages: updates `conversation.lastMessage`, invalidates participants' conversation-list caches, emits `message:new` to each other participant's user room, and **enqueues** an offline email + push/bell notification for participants who are currently offline (respecting per-chat mute).
 - The sender is automatically added to `readBy`.
+- Prefer upload-then-send? Use **`POST /api/uploads`** (§17) to store the file first, then send a normal JSON message with `type: "image" | "file"` and `content` set to the returned URL.
 
 ---
 
@@ -1058,10 +1101,59 @@ User model, role-aware middleware, and an `/api/admin/*` router.
 
 ## 17. File Uploads
 
-**Not implemented as an endpoint.** By design the API stores **media URLs only** — clients upload
-binaries to S3/Cloudinary and then send the resulting URL as a message with `type: "image" | "file"`
-(see D.1). `CLOUDINARY_*` env keys may be present but are not wired into any route yet. A future
-`POST /api/uploads` (signed upload or multipart → CDN) would slot in here.
+Files are uploaded through the API using a **buffer + stream** pipeline: `multipart/form-data` →
+in-memory Buffer (multer `memoryStorage()`, no disk writes) → streamed to Cloudinary via
+`upload_stream`. Allowed types are **PDF** and images (`jpeg`, `png`, `webp`, `gif`), max **10 MB**.
+The real type is verified from the file's magic bytes (not the declared mimetype/extension), and a
+declared type that doesn't match the bytes is rejected. Requires `CLOUDINARY_CLOUD_NAME`,
+`CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`.
+
+There are **two ways** to send a file:
+
+1. **Send directly as a message** — `POST /api/messages` with `multipart/form-data` (see **D.1**,
+   Variant 2). One request: upload + create + deliver the message.
+
+2. **Upload then send** — `POST /api/uploads` stores the file and returns its descriptor; the client
+   then sends a normal JSON message referencing the URL.
+
+### 17.1 Upload a File (standalone)
+
+| | |
+|---|---|
+| **HTTP Method** | `POST` |
+| **URL Path** | `/api/uploads` |
+| **Purpose** | Run the verify + stream pipeline and return the stored asset |
+| **Auth Required** | Yes |
+| **Content-Type** | `multipart/form-data` |
+
+**Request** — a single `file` part (PDF or image, ≤ 10 MB).
+
+**Success Response — `201 Created`**
+```json
+{
+  "success": true,
+  "message": "File uploaded",
+  "data": {
+    "url": "https://res.cloudinary.com/<cloud>/image/upload/v1/chatloop/messages/abc123.png",
+    "type": "image",
+    "mimeType": "image/png",
+    "size": 51234,
+    "originalName": "screenshot.png"
+  }
+}
+```
+
+**Error Responses**
+
+| Status | Reason |
+|--------|--------|
+| `400` | No `file` part provided |
+| `401` | Not authenticated |
+| `413` | File exceeds 10MB |
+| `415` | Disallowed or spoofed file type |
+
+**Next step:** send the returned `url` as a message — `POST /api/messages` (JSON) with
+`{ "conversationId": "CVE-…", "content": "<url>", "type": "image" | "file" }`.
 
 ---
 
@@ -1090,11 +1182,14 @@ Chat Application API/
 │   ├── Get Conversation          GET    {{baseUrl}}/api/conversations/:id
 │   └── Delete / Leave            DELETE {{baseUrl}}/api/conversations/:id
 ├── Messages/
-│   ├── Send Message              POST   {{baseUrl}}/api/messages
+│   ├── Send Message (text)       POST   {{baseUrl}}/api/messages          (application/json)
+│   ├── Send File (PDF/image)     POST   {{baseUrl}}/api/messages          (multipart/form-data: file, conversationId, caption?)
 │   ├── Get History               GET    {{baseUrl}}/api/messages/:conversationId?limit=20
 │   ├── Mark One Read             PATCH  {{baseUrl}}/api/messages/:id/read
 │   ├── Mark Conversation Read    POST   {{baseUrl}}/api/messages/:conversationId/read
 │   └── Delete Message            DELETE {{baseUrl}}/api/messages/:id
+├── Uploads/
+│   └── Upload File (standalone)  POST   {{baseUrl}}/api/uploads           (multipart/form-data: file)
 └── (Health)
     └── Health Check              GET    {{baseUrl}}/health
 ```
