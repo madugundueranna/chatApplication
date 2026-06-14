@@ -1,0 +1,36 @@
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
+import ChartCard from './ChartCard';
+
+// data: [{ label, value }]
+export default function LineChartCard({ title, data = [], loading, color = '#2563EB' }) {
+  return (
+    <ChartCard title={title} loading={loading} isEmpty={!data.length}>
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={data} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+          <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#94a3b8' }} tickMargin={8} />
+          <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: '#94a3b8' }} width={40} />
+          <Tooltip
+            contentStyle={{ borderRadius: 8, border: '1px solid #e2e8f0', fontSize: 12 }}
+          />
+          <Line
+            type="monotone"
+            dataKey="value"
+            stroke={color}
+            strokeWidth={2}
+            dot={false}
+            activeDot={{ r: 4 }}
+          />
+        </LineChart>
+      </ResponsiveContainer>
+    </ChartCard>
+  );
+}
