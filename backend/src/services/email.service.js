@@ -47,14 +47,6 @@ export const sendPasswordResetEmail = (to, code) => {
   });
 };
 
-export const sendNewMessageEmail = (to, senderName) =>
-  sendMail({
-    to,
-    subject: 'New message',
-    text: `You have a new message from ${senderName}.`,
-    html: `<p>You have a new message from <strong>${senderName}</strong>.</p>`,
-  });
-
 export const sendIncomingCallEmail = (to, callerName, type) =>
   sendMail({
     to,

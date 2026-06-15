@@ -4,7 +4,6 @@ import { notificationQueue, QUEUE_NAMES } from './index.js';
 import {
   sendOtpEmail,
   sendPasswordResetEmail,
-  sendNewMessageEmail,
   sendIncomingCallEmail,
   sendMissedCallEmail,
 } from '../services/email.service.js';
@@ -13,7 +12,6 @@ import { sendPushToUser } from '../services/push.service.js';
 export const JOBS = {
   OTP_EMAIL: 'otp-email',
   PASSWORD_RESET: 'password-reset',
-  NEW_MESSAGE: 'new-message',
   INCOMING_CALL: 'incoming-call',
   MISSED_CALL: 'missed-call',
   PUSH_NOTIFICATION: 'push-notification',
@@ -24,8 +22,6 @@ export const enqueueOtpEmail = (email, code) => notificationQueue.add(JOBS.OTP_E
 
 export const enqueuePasswordResetEmail = (email, code) =>
   notificationQueue.add(JOBS.PASSWORD_RESET, { email, code });
-
-export const enqueueNewMessage = (payload) => notificationQueue.add(JOBS.NEW_MESSAGE, payload);
 
 export const enqueueIncomingCall = (payload) => notificationQueue.add(JOBS.INCOMING_CALL, payload);
 
@@ -38,8 +34,6 @@ export const enqueuePushNotification = (payload) =>
 const processors = {
   [JOBS.OTP_EMAIL]: ({ email, code }) => sendOtpEmail(email, code),
   [JOBS.PASSWORD_RESET]: ({ email, code }) => sendPasswordResetEmail(email, code),
-  [JOBS.NEW_MESSAGE]: ({ recipients, senderName }) =>
-    Promise.all(recipients.map((to) => sendNewMessageEmail(to, senderName))),
   [JOBS.INCOMING_CALL]: ({ email, callerName, type }) =>
     sendIncomingCallEmail(email, callerName, type),
   [JOBS.MISSED_CALL]: ({ email, callerName, type }) => sendMissedCallEmail(email, callerName, type),

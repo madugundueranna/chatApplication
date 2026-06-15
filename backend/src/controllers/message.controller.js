@@ -15,7 +15,6 @@ import {
 } from '../common/Constants.js';
 import * as cache from '../services/cache.service.js';
 import { getIo } from '../socket/index.js';
-import { enqueueNewMessage } from '../queues/notification.queue.js';
 import { notify } from '../services/notification.service.js';
 import { areBlocked } from '../services/block.service.js';
 import { invalidateConversationLists } from './conversation.controller.js';
@@ -115,27 +114,22 @@ export const createAndDispatchMessage = async ({
   await invalidateConversationLists(participantIds);
   await cache.del(CACHE_KEYS.recentMessages(conversation.conversationId));
 
-  const sender = await User.findOne({ userId: senderId }).select('userId name avatar email').lean();
+  const sender = await User.findOne({ userId: senderId }).select('userId name avatar').lean();
   const payload = serializeMessage(message, conversation.conversationId);
 
   const others = participantIds.filter((id) => id !== String(senderId));
   emitToUsers(others, SOCKET_EVENTS.MESSAGE_NEW, payload);
 
   // Notify away recipients: online users already have the live message + chat
-  // list, so a bell entry/email/push is only worth it for those currently offline.
+  // list, so a bell entry + push is only worth it for those currently offline.
   const offline = await cache.filterOffline(others);
-  // Respect per-user mute: muted participants get no email/push/bell for this chat
+  // Respect per-user mute: muted participants get no push/bell for this chat
   // (the live message still reaches an open chat above).
   const mutedSet = new Set(
     (conversation.participantStates || []).filter((s) => s.muted).map((s) => s.userId)
   );
   const notifiable = offline.filter((id) => !mutedSet.has(id));
   if (notifiable.length) {
-    const recipients = await User.find({ userId: { $in: notifiable } }).select('email').lean();
-    await enqueueNewMessage({
-      recipients: recipients.map((u) => u.email),
-      senderName: sender?.name || 'Someone',
-    });
     const senderName = sender?.name || 'Someone';
     const title =
       conversation.type === CONVERSATION_TYPES.GROUP && conversation.name

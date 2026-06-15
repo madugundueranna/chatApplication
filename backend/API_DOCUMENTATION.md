@@ -1,8 +1,8 @@
 # Chat Application — API Documentation
 
 Real-time chat backend built with **Express + MongoDB (Mongoose) + Redis (ioredis) +
-Socket.io + BullMQ** (ES Modules). This document is the source of truth for the REST API and
-the Socket.io real-time contract, and is structured for direct use in Postman.
+Socket.io + BullMQ + Cloudinary** (ES Modules). This document is the source of truth for the
+REST API and the Socket.io real-time contract.
 
 ---
 
@@ -11,43 +11,55 @@ the Socket.io real-time contract, and is structured for direct use in Postman.
 | Item | Value |
 |------|-------|
 | Name | `chat-backend` |
-| Purpose | Real-time 1:1 and group chat with auth, presence, typing, read receipts, and offline notifications |
+| Purpose | Real-time 1:1 & group chat with auth, presence, typing, read receipts, calls (WebRTC signaling), ephemeral status/stories, notifications and moderation |
 | Runtime | Node.js ≥ 20 (ES Modules) |
 | Transport | REST (HTTP/JSON) + Socket.io (WebSocket) |
 | Persistence | MongoDB (Mongoose) |
-| Cache / presence / pub-sub | Redis (single shared `ioredis` client) |
-| Background jobs | BullMQ (`notifications` queue + worker) |
-| Auth | JWT access + refresh tokens; `bcrypt` password hashing; email OTP verification |
+| Cache / presence / pub-sub / live call state | Redis (ioredis) |
+| Background jobs | BullMQ (`notifications` queue + worker: email + Expo push) |
+| Media | Cloudinary (avatars, status media, image/file messages) |
+| Auth | JWT access + refresh; `bcrypt` hashing; email OTP verification |
 
-**Resource model**
-- **User** — account, profile, verification state, presence, refresh tokens.
-- **Conversation** ("Chat") — `direct` (2 participants) or `group` (N participants).
-- **Message** — belongs to a conversation; tracks `readBy` and soft-delete.
+**Resources:** User, Conversation (`direct`/`group`), Message, Call, Notification, Status
+(story), Report.
 
 ---
 
-## 2. Base URL
+## 2. Readable IDs (IMPORTANT)
 
-| Environment | Base URL |
-|-------------|----------|
+The API **never exposes Mongo `_id`**. Every document has a public, human-readable prefixed id,
+and **all cross-document references are stored and returned as these id strings** (not ObjectIds):
+
+| Resource | Prefix | Example |
+|----------|--------|---------|
+| User | `USR-` | `USR-A1B2C3` |
+| Conversation | `CVE-` | `CVE-A1B2C3` |
+| Message | `MSG-` | `MSG-A1B2C3` |
+| Call | `CAL-` | `CAL-A1B2C3` |
+| Notification | `NOT-` | `NOT-A1B2C3` |
+| Status | `STA-` | `STA-A1B2C3` |
+| Report | `REP-` | `REP-A1B2C3` |
+
+Format: `PREFIX-[A-Z0-9]{6}`. So a message's `sender` is a `USR-…`, its `conversation` is a
+`CVE-…`, a conversation's `participants` is an array of `USR-…`, etc. Path params and body refs
+are validated against this format (invalid → `422`).
+
+> Cursor pagination (`GET /messages`, `/calls`, `/notifications`) uses an **opaque Mongo
+> ObjectId hex** as the `nextCursor`/`cursor` value — the one place a raw id surfaces. Pass it
+> back verbatim.
+
+---
+
+## 3. Base URL
+
+| | |
+|--|--|
 | Local | `http://localhost:5000` |
 | API prefix | `/api` |
-| Health check | `GET http://localhost:5000/health` |
-| Landing page | `GET http://localhost:5000/` (HTML) |
+| Health | `GET /health` |
+| Socket.io | connects to the **root** origin (`http://localhost:5000`), not under `/api` |
 
-All REST endpoints below are relative to `http://localhost:5000/api`.
-Socket.io connects to the root origin `http://localhost:5000` (not under `/api`).
-
----
-
-## 3. API Versioning
-
-**Current:** the API is **unversioned** — routes are mounted directly under `/api` (e.g.
-`/api/auth/login`). There is no `/v1` segment.
-
-**Recommendation:** when a breaking change is needed, introduce a prefix (`/api/v1`) and keep
-the old version mounted until clients migrate. The router structure (one router per resource)
-makes this a one-line change in `app.js`.
+The API is **unversioned** (routes mounted directly under `/api`).
 
 ---
 
@@ -56,1183 +68,364 @@ makes this a one-line change in `app.js`.
 JWT-based, with email OTP verification before first login.
 
 ```
-register ──▶ (OTP emailed) ──▶ verify-otp ──▶ login ──▶ { accessToken, refreshToken }
-                                   ▲                          │
-                              resend-otp                      │ accessToken expires (15m)
-                                                              ▼
-                                                          refresh ──▶ new accessToken
-                                                              │
-                                                           logout ──▶ refreshToken revoked
+register ─▶ (OTP emailed) ─▶ verify-otp ─▶ login ─▶ { accessToken, refreshToken }
+                                 ▲                        │ access expires (15m)
+                            resend-otp                    ▼
+                                                      refresh ─▶ new accessToken
+                                                          │
+                                                       logout ─▶ refreshToken revoked
 ```
 
-1. **Register** with name/email/password → user created as unverified; a 6-digit OTP is
-   **enqueued** and emailed (the request does not block on email sending).
-2. **Verify OTP** → account marked verified, OTP cleared.
-3. **Login** (rejected until verified) → returns a short-lived `accessToken` and a long-lived
-   `refreshToken`. The refresh token is stored on the user (multi-device).
-4. **Authenticated requests** send `Authorization: Bearer <accessToken>`.
-5. **Refresh** exchanges a valid, non-revoked `refreshToken` for a new `accessToken`.
-6. **Logout** removes the supplied `refreshToken` from the user (that device is signed out).
+| Token | Lifetime (default) | Sent as | Config |
+|-------|--------------------|---------|--------|
+| Access | `15m` | `Authorization: Bearer <token>` header (native) **or** HttpOnly cookie (web) | `JWT_ACCESS_EXPIRES` |
+| Refresh | `7d` | JSON body `{ refreshToken }` **or** HttpOnly cookie | `JWT_REFRESH_EXPIRES` |
 
-| Token | Lifetime (default) | Sent as | Configurable via |
-|-------|--------------------|---------|------------------|
-| Access | `15m` | `Authorization: Bearer <token>` header | `JWT_ACCESS_EXPIRES` |
-| Refresh | `7d` | JSON body `{ "refreshToken": "..." }` | `JWT_REFRESH_EXPIRES` |
-
-**Socket.io auth:** pass the access token in the handshake — `io(URL, { auth: { token } })`.
-Invalid/missing tokens are rejected at the handshake (`connect_error`).
+- Login is rejected (`403`) until the account is verified, and (`403`) if the account is banned (`isActive:false`).
+- Each login appends a refresh token to the user (multi-device). Banning / `reset-password` revokes all.
+- **Socket.io auth:** native passes the token in the handshake (`io(URL,{auth:{token}})`); web uses the cookie. Invalid/missing → `connect_error`.
 
 ---
 
-## 5. Common Response Format
+## 5. Response Envelope
 
-Every JSON response uses a single envelope:
+Every JSON response uses one envelope:
 
 ```json
-{
-  "success": true,
-  "message": "Human-readable summary",
-  "data": { }
-}
+{ "success": true, "message": "Human-readable summary", "data": {} }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `success` | boolean | `true` for 2xx, `false` for errors |
-| `message` | string | Human-readable summary |
-| `data` | object \| array \| null | Payload on success; `null` (or a field-error array on validation failures) otherwise |
+- `success` — `true` for 2xx, `false` for errors.
+- `data` — payload on success; `null` on most errors; an **array of field errors** on `422`.
 
 ---
 
-## 6. Error Handling Standards
+## 6. Error Handling
 
-All errors return the common envelope with `success: false` and `data: null` (except validation
-errors, where `data` is an array of field errors). Errors are produced by a central
-`ApiError` + global error middleware; controllers never format errors inline.
+| Status | When |
+|--------|------|
+| `400` | Business-rule violation (e.g. self-conversation, "media or text required", "too late to delete for everyone") |
+| `401` | Missing/invalid/expired access token; bad login; revoked refresh token |
+| `403` | Not verified; banned; not a conversation participant; deleting another user's message; messaging a blocked user; admin-only / owner-only resource |
+| `404` | Unknown user/conversation/message/status/report |
+| `409` | Email already registered |
+| `422` | Validation failed — `data` is `[{ field, message }]` |
+| `429` | Rate limit (auth routes) |
+| `500` | Unexpected (message masked) |
 
-| HTTP Status | Meaning | When it occurs |
-|-------------|---------|----------------|
-| `400 Bad Request` | Malformed/invalid operation | Invalid OTP, business-rule violation (e.g. self-conversation), invalid identifier (`CastError`) |
-| `401 Unauthorized` | Missing/invalid credentials | No/invalid/expired access token; bad login; revoked refresh token |
-| `403 Forbidden` | Authenticated but not allowed | Account not verified; not a conversation participant; deleting another user's message |
-| `404 Not Found` | Resource missing | Unknown user/conversation/message; unmatched route (returns HTML 404 page) |
-| `409 Conflict` | Duplicate | Email already registered (also Mongo duplicate-key `11000`) |
-| `422 Unprocessable Entity` | Validation failed | `express-validator` chain failed; `data` lists `{ field, message }` |
-| `429 Too Many Requests` | Rate limit hit | More than 20 requests/15 min to `/api/auth/*` |
-| `500 Internal Server Error` | Unexpected | Unhandled error; message is masked to `Internal server error` |
-
-**Validation error example (`422`):**
+**422 example:**
 ```json
-{
-  "success": false,
-  "message": "Validation failed",
-  "data": [
-    { "field": "email", "message": "A valid email is required" },
-    { "field": "password", "message": "Password must be at least 6 characters" }
-  ]
-}
-```
-
-**Generic error example:**
-```json
-{ "success": false, "message": "Invalid or expired token", "data": null }
+{ "success": false, "message": "Validation failed",
+  "data": [{ "field": "email", "message": "A valid email is required" }] }
 ```
 
 ---
 
-## 7. Rate Limiting Information
+## 7. Rate Limiting
 
-| Scope | Limit | Window | Store | Notes |
-|-------|-------|--------|-------|-------|
-| `/api/auth/*` | 20 requests | 15 minutes | Redis (`rate-limit-redis`) | Per client IP; shared across instances via Redis |
-| All other routes | Unlimited | — | — | Not rate-limited in the current version |
-
-When exceeded, responds `429`:
-```json
-{ "success": false, "message": "Too many attempts, please try again later.", "data": null }
-```
-Standard rate-limit headers (`RateLimit-*`) are returned.
+`/api/auth/*` — 100 requests / 15 min / IP (Redis-backed). Other routes are not rate-limited.
 
 ---
 
 ## 8. Environment Variables
 
-Copy `.env.example` → `.env` and fill in values.
-
-| Variable | Required | Example / Default | Description |
-|----------|----------|-------------------|-------------|
-| `NODE_ENV` | no | `development` | Runtime environment |
-| `PORT` | no | `5000` | HTTP port |
-| `CORS_ORIGIN` | yes | `http://localhost:3000` | Allowed browser origin (also used for Socket.io CORS) |
-| `MONGODB_URI` | yes | `mongodb://127.0.0.1:27017/chatApplication` | MongoDB connection string |
-| `REDIS_URL` | yes | `redis://127.0.0.1:6379` | Redis URL. Cloud Redis requiring TLS (e.g. Upstash) **must** use `rediss://` |
-| `JWT_ACCESS_SECRET` | yes | (random string) | Signs access tokens |
-| `JWT_ACCESS_EXPIRES` | no | `15m` | Access token lifetime |
-| `JWT_REFRESH_SECRET` | yes | (random string) | Signs refresh tokens |
-| `JWT_REFRESH_EXPIRES` | no | `7d` | Refresh token lifetime |
-| `BCRYPT_ROUNDS` | no | `10` | bcrypt cost factor |
-| `OTP_TTL_MINUTES` | no | `10` | OTP validity window |
-| `SMTP_HOST` | yes (for email) | `smtp.gmail.com` | SMTP server host |
-| `SMTP_PORT` | yes (for email) | `587` | SMTP port (`465` ⇒ implicit TLS, else STARTTLS) |
-| `SMTP_USER` | yes (for email) | `you@gmail.com` | SMTP username |
-| `SMTP_PASS` | yes (for email) | (app password) | SMTP password / Gmail App Password |
-| `SMTP_FROM` | yes (for email) | `Chat App <you@gmail.com>` | From header (Gmail rewrites to the authenticated user) |
-| `CLOUDINARY_CLOUD_NAME` | yes (for uploads) | `your_cloud_name` | Cloudinary account — file/image messages, status media & avatars stream here |
-| `CLOUDINARY_API_KEY` | yes (for uploads) | `your_api_key` | Cloudinary API key |
-| `CLOUDINARY_API_SECRET` | yes (for uploads) | `your_api_secret` | Cloudinary API secret (server-side only) |
-
-> `CLOUDINARY_*` keys are **required** for uploads — file/image messages, status media and avatar
-> uploads stream to Cloudinary (see §17). `GOOGLE_*` keys may appear in some `.env` files but are
-> **not used** (OAuth is not implemented).
+| Variable | Required | Notes |
+|----------|----------|-------|
+| `PORT` | no | default `5000` |
+| `CORS_ORIGIN` | yes | allowed browser origin (also Socket.io CORS) |
+| `MONGODB_URI` | yes | MongoDB connection string |
+| `REDIS_URL` | yes | `redis://…` (cloud TLS ⇒ `rediss://`) |
+| `JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET` | yes | token signing |
+| `JWT_ACCESS_EXPIRES` / `JWT_REFRESH_EXPIRES` | no | `15m` / `7d` |
+| `BCRYPT_ROUNDS` | no | `10` |
+| `OTP_TTL_MINUTES` | no | `10` |
+| `SMTP_HOST/PORT/USER/PASS/FROM` | for email | OTP + offline-message emails |
+| `CLOUDINARY_CLOUD_NAME/API_KEY/API_SECRET` | for media | avatars, status, image/file messages |
+| `ADMIN_EMAIL` | for admin | account auto-promoted to `admin` on startup |
+| `DELETE_FOR_EVERYONE_WINDOW_SECONDS` | no | `3600` — window for "delete for everyone" |
+| `EXPO_ACCESS_TOKEN` | for push | Expo push notifications |
+| `STUN_URLS` / `TURN_URLS` / `TURN_STATIC_AUTH_SECRET` / `METERED_API_KEY` / `METERED_DOMAIN` | for calls | ICE/TURN config |
 
 ---
 
 # REST API Reference
 
-> Conventions for every endpoint below:
-> - **Request Headers:** `Content-Type: application/json` for requests with a body; protected
->   endpoints also require `Authorization: Bearer <accessToken>`.
-> - **Error Responses:** all follow §6. Only endpoint-specific cases are called out.
-> - All authenticated user context (`req.user.id`) is derived from the access token, never the body.
+> Protected endpoints require `Authorization: Bearer <accessToken>` (or the web auth cookie).
+> User context (`req.user`) is always derived from the token, never the body.
 
 ---
 
 ## Section A — Authentication (`/api/auth`)
 
-> Rate-limited: 20 requests / 15 min / IP. No authentication required (these establish it).
+> Rate-limited. No auth required.
 
-### A.1 Register
+| Method | Path | Body | Success |
+|--------|------|------|---------|
+| POST | `/register` | `{ name, email, password }` | `201` `{ userId }` — OTP emailed (queued) |
+| POST | `/verify-otp` | `{ email, code }` | `200` |
+| POST | `/resend-otp` | `{ email }` | `200` |
+| POST | `/login` | `{ email, password }` | `200` `{ accessToken, refreshToken, user }` |
+| POST | `/refresh` | `{ refreshToken }` (or cookie) | `200` `{ accessToken }` |
+| POST | `/logout` | `{ refreshToken }` (or cookie) | `200` |
+| POST | `/forgot-password` | `{ email }` | `200` (always identical — never reveals if the email exists) |
+| POST | `/reset-password` | `{ email, code, password }` | `200` — also verifies the account and revokes all sessions |
 
-| | |
-|---|---|
-| **Endpoint Name** | Register |
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/auth/register` |
-| **Purpose** | Create an unverified account and email an OTP |
-| **Auth Required** | No |
-| **Path Params** | None |
-| **Query Params** | None |
-
-**Request Headers**
-
-| Header | Value |
-|--------|-------|
-| `Content-Type` | `application/json` |
-
-**Request Body Schema**
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `name` | string | yes | Non-empty (trimmed) |
-| `email` | string | yes | Valid email; normalized to lowercase |
-| `password` | string | yes | Min length 6 |
-
-**Success Response — `201 Created`**
+**`login` → `user`:**
 ```json
-{
-  "success": true,
-  "message": "Registered. Verify the OTP sent to your email.",
-  "data": { "userId": "6a2776dc48722dfdf84de4e8" }
-}
+{ "userId": "USR-A1B2C3", "name": "Alice", "email": "alice@example.com",
+  "avatar": "", "isVerified": true, "isVerifiedAccount": false,
+  "role": "user", "isActive": true }
 ```
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `409` | Email already registered |
-| `422` | Validation failed |
-| `429` | Rate limited |
-
-**Example Request**
-```bash
-curl -X POST http://localhost:5000/api/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Alice","email":"alice@example.com","password":"secret123"}'
-```
-
-**Notes / Business Rules**
-- The OTP email is **enqueued** (BullMQ); the response returns immediately and does not wait for SMTP.
-- The OTP is never returned in the response.
-
----
-
-### A.2 Verify OTP
-
-| | |
-|---|---|
-| **Endpoint Name** | Verify OTP |
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/auth/verify-otp` |
-| **Purpose** | Verify the emailed OTP and activate the account |
-| **Auth Required** | No |
-
-**Request Body Schema**
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `email` | string | yes | Valid email |
-| `code` | string | yes | Length 4–8 |
-
-**Success Response — `200 OK`**
-```json
-{ "success": true, "message": "Account verified", "data": null }
-```
-(If already verified: `message: "Already verified"`.)
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `400` | Invalid or expired OTP |
-| `404` | User not found |
-| `422` | Validation failed |
-
-**Example Request**
-```bash
-curl -X POST http://localhost:5000/api/auth/verify-otp \
-  -H "Content-Type: application/json" \
-  -d '{"email":"alice@example.com","code":"278615"}'
-```
-
-**Notes / Business Rules**
-- OTP validity is `OTP_TTL_MINUTES` (default 10). On success the OTP is cleared.
-
----
-
-### A.3 Resend OTP
-
-| | |
-|---|---|
-| **Endpoint Name** | Resend OTP |
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/auth/resend-otp` |
-| **Purpose** | Regenerate and re-email an OTP |
-| **Auth Required** | No |
-
-**Request Body Schema**
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `email` | string | yes | Valid email |
-
-**Success Response — `200 OK`**
-```json
-{ "success": true, "message": "OTP resent", "data": null }
-```
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `400` | Account already verified |
-| `404` | User not found |
-| `422` | Validation failed |
-
----
-
-### A.4 Login
-
-| | |
-|---|---|
-| **Endpoint Name** | Login |
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/auth/login` |
-| **Purpose** | Authenticate and issue tokens |
-| **Auth Required** | No |
-
-**Request Body Schema**
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `email` | string | yes | Valid email |
-| `password` | string | yes | Non-empty |
-
-**Success Response — `200 OK`**
-```json
-{
-  "success": true,
-  "message": "Login successful",
-  "data": {
-    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "user": {
-      "_id": "6a2776dc48722dfdf84de4e8",
-      "name": "Alice",
-      "email": "alice@example.com",
-      "avatar": "",
-      "isVerified": true
-    }
-  }
-}
-```
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `401` | Invalid credentials |
-| `403` | Account not verified |
-| `422` | Validation failed |
-
-**Notes / Business Rules**
-- Login is rejected with `403` until the account is verified.
-- Each successful login appends a refresh token to the user (supports multi-device sessions).
-
----
-
-### A.5 Refresh Access Token
-
-| | |
-|---|---|
-| **Endpoint Name** | Refresh Token |
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/auth/refresh` |
-| **Purpose** | Exchange a refresh token for a new access token |
-| **Auth Required** | No (the refresh token itself is the credential) |
-
-**Request Body Schema**
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `refreshToken` | string | yes | Non-empty |
-
-**Success Response — `200 OK`**
-```json
-{ "success": true, "message": "Token refreshed", "data": { "accessToken": "eyJ..." } }
-```
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `401` | Invalid refresh token, or token revoked (not on the user) |
-| `422` | Validation failed |
-
----
-
-### A.6 Logout
-
-| | |
-|---|---|
-| **Endpoint Name** | Logout |
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/auth/logout` |
-| **Purpose** | Revoke a refresh token (sign out one device) |
-| **Auth Required** | No |
-
-**Request Body Schema**
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `refreshToken` | string | yes | Non-empty |
-
-**Success Response — `200 OK`**
-```json
-{ "success": true, "message": "Logged out", "data": null }
-```
-
-**Notes / Business Rules**
-- Idempotent: returns `200` even if the token was already absent.
 
 ---
 
 ## Section B — Users (`/api/users`)
 
-> **All endpoints require authentication** (`Authorization: Bearer <accessToken>`).
+> All require auth.
 
-### B.1 Get My Profile
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/me` | Current profile (cached 300s, invalidated on change). |
+| PATCH | `/me` | Body `{ name?, avatar? }`. Email/password not editable here. |
+| POST | `/me/avatar` | **multipart** `avatar` (image only) → uploads to Cloudinary, returns profile. |
+| GET | `/search?q=` | Verified users matching name/email (≤20), excludes you. Online status hidden for blocked relationships. |
+| GET | `/blocked` | Users you've blocked → `[{ userId, name, avatar }]`. |
+| POST | `/block/:userId` | `{ userId, blocked: true }`. |
+| POST | `/unblock/:userId` | `{ userId, blocked: false }`. |
+| POST | `/report/:userId` | Body `{ reason }` (≤500). `201 { reportId }`. |
+| GET | `/:userId` | Public profile. `isOnline`/`lastSeen` are hidden (false/null) if either user has blocked the other. |
 
-| | |
-|---|---|
-| **Endpoint Name** | Get Current User |
-| **HTTP Method** | `GET` |
-| **URL Path** | `/api/users/me` |
-| **Purpose** | Return the authenticated user's profile |
-| **Auth Required** | Yes |
-| **Body** | None |
-
-**Success Response — `200 OK`**
+**`/me` response:**
 ```json
-{
-  "success": true,
-  "message": "Profile fetched",
-  "data": {
-    "_id": "6a2776dc48722dfdf84de4e8",
-    "name": "Alice",
-    "email": "alice@example.com",
-    "avatar": "",
-    "isOnline": false,
-    "lastSeen": "2026-06-09T02:10:00.000Z",
-    "isVerified": true,
-    "createdAt": "2026-06-09T02:13:48.501Z"
-  }
-}
+{ "userId": "USR-A1B2C3", "name": "Alice", "email": "alice@example.com", "avatar": "",
+  "role": "user", "isActive": true, "isOnline": false, "lastSeen": "2026-06-09T02:10:00.000Z",
+  "isVerified": true, "isVerifiedAccount": false, "createdAt": "2026-06-09T02:13:48.501Z" }
 ```
 
-**Error Responses:** `401` (no/invalid token), `404` (user deleted).
-
-**Notes / Business Rules**
-- **Cache-aside**: the profile is cached in Redis (TTL 300s) and invalidated on update.
+> `isVerified` = email/OTP confirmed (gates login). `isVerifiedAccount` = admin-granted "verified" badge (the blue tick) — distinct concept.
 
 ---
 
-### B.2 Update My Profile
+## Section C — Conversations (`/api/conversations`)
 
-| | |
-|---|---|
-| **Endpoint Name** | Update Current User |
-| **HTTP Method** | `PATCH` |
-| **URL Path** | `/api/users/me` |
-| **Purpose** | Update name and/or avatar |
-| **Auth Required** | Yes |
+> All require auth.
 
-**Request Body Schema** (send any subset)
+### C.1 Create or fetch — `POST /`
+Body: `{ type?, participantId?, participants?, name? }`.
+- **direct** (default): `participantId` (USR-). Deduplicated — returns the existing 1:1 if present (`200`), else creates (`201`). Blocked either way → `403`.
+- **group**: `name` + `participants` (USR-[]). `201`.
 
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `name` | string | no | If present, non-empty |
-| `avatar` | string | no | If present, a string (e.g. a CDN URL) |
+Returns the **conversation detail** shape (below).
 
-**Success Response — `200 OK`** — same shape as B.1 with updated values.
-
-**Error Responses:** `401`, `404`, `422`.
-
-**Notes / Business Rules**
-- Invalidates the cached profile. Email and password are **not** editable here.
-
----
-
-### B.3 Search Users
-
-| | |
-|---|---|
-| **Endpoint Name** | Search Users |
-| **HTTP Method** | `GET` |
-| **URL Path** | `/api/users/search` |
-| **Purpose** | Find other verified users by name or email |
-| **Auth Required** | Yes |
-
-**Query Parameters**
-
-| Param | Type | Required | Rules |
-|-------|------|----------|-------|
-| `q` | string | yes | Non-empty; case-insensitive match on name or email |
-
-**Success Response — `200 OK`**
+### C.2 List — `GET /`
+Your conversations, newest-activity first (cached per user, 30s). Array of **list items**:
 ```json
-{
-  "success": true,
-  "message": "Search results",
-  "data": [
-    { "_id": "6a2776f348722dfdf84de4f1", "name": "Bob", "avatar": "", "isOnline": false }
-  ]
-}
+{ "conversationId": "CVE-…", "type": "direct", "name": null,
+  "otherParticipants": [{ "userId": "USR-…", "name": "Bob", "avatar": "", "isOnline": false, "lastSeen": null }],
+  "lastMessage": { "messageId": "MSG-…", "content": "Hi", "type": "text", "sender": "USR-…", "createdAt": "…" },
+  "unreadCount": 2, "muted": false, "updatedAt": "…" }
 ```
 
-**Error Responses:** `401`, `422` (missing `q`).
-
-**Notes / Business Rules**
-- Excludes the requester; returns only **verified** users; max 20 results (single aggregation).
-- Only public fields are returned (`_id, name, avatar, isOnline`).
-
-**Example Request**
-```bash
-curl "http://localhost:5000/api/users/search?q=bob" -H "Authorization: Bearer $TOKEN"
-```
-
----
-
-### B.4 Get User By ID
-
-| | |
-|---|---|
-| **Endpoint Name** | Get User By ID |
-| **HTTP Method** | `GET` |
-| **URL Path** | `/api/users/:id` |
-| **Purpose** | Public profile of a specific user |
-| **Auth Required** | Yes |
-
-**Path Parameters**
-
-| Param | Type | Required | Rules |
-|-------|------|----------|-------|
-| `id` | string | yes | Valid Mongo ObjectId |
-
-**Success Response — `200 OK`**
+### C.3 Detail — `GET /:conversationId`
+Participant-only. **Conversation detail** shape:
 ```json
-{
-  "success": true,
-  "message": "User fetched",
-  "data": {
-    "_id": "6a2776f348722dfdf84de4f1",
-    "name": "Bob",
-    "avatar": "",
-    "isOnline": false,
-    "lastSeen": "2026-06-09T02:09:00.000Z"
-  }
-}
+{ "conversationId": "CVE-…", "type": "direct", "name": null,
+  "participants": [{ "userId": "USR-…", "name": "Alice", "avatar": "", "isOnline": true, "lastSeen": null }],
+  "createdBy": "USR-…",
+  "lastMessage": { "messageId": "MSG-…", "content": "Hi", "type": "text", "createdAt": "…", "sender": "USR-…" },
+  "muted": false, "createdAt": "…", "updatedAt": "…" }
 ```
 
-**Error Responses:** `401`, `404` (no such user), `422` (id not a valid ObjectId).
-
----
-
-## Section C — Chats / Conversations (`/api/conversations`)
-
-> **All endpoints require authentication.** A "Chat" is a `Conversation` (`direct` or `group`).
-
-### C.1 Create or Fetch Conversation
-
-| | |
-|---|---|
-| **Endpoint Name** | Create / Fetch Conversation |
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/conversations` |
-| **Purpose** | Start (or fetch an existing) direct chat, or create a group |
-| **Auth Required** | Yes |
-
-**Request Body Schema**
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `type` | string | no | `direct` (default) or `group` |
-| `participantId` | string | for `direct` | Valid ObjectId of the other user |
-| `participants` | string[] | for `group` | Non-empty array of ObjectIds |
-| `name` | string | for `group` | Non-empty group name |
-
-**Validation Rules**
-- `type` ∈ {`direct`, `group`}; `participantId` and each `participants[*]` must be valid ObjectIds;
-  `name` (if present) non-empty. Resource-level rules (below) are enforced in the controller.
-
-**Success Response**
-- **Direct, existing** → `200 OK`, `message: "Conversation fetched"`
-- **Direct, new** → `201 Created`, `message: "Conversation created"`
-- **Group, new** → `201 Created`, `message: "Group created"`
-
-```json
-{
-  "success": true,
-  "message": "Conversation created",
-  "data": {
-    "_id": "6a2776f448722dfdf84de4f7",
-    "type": "direct",
-    "participants": ["6a2776dc48722dfdf84de4e8", "6a2776f348722dfdf84de4f1"],
-    "createdBy": "6a2776dc48722dfdf84de4e8",
-    "createdAt": "2026-06-09T02:14:12.493Z",
-    "updatedAt": "2026-06-09T02:14:12.493Z",
-    "__v": 0
-  }
-}
-```
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `400` | `direct` without `participantId`; conversation with yourself; `group` without `name`/`participants` |
-| `401` | Not authenticated |
-| `422` | Invalid ObjectId / type |
-
-**Notes / Business Rules**
-- **Direct chats are deduplicated**: an existing 2-party direct conversation is returned instead of creating a duplicate.
-- The requester is always added to `participants` (groups dedupe members).
-- Affected participants' cached conversation lists are invalidated.
-
----
-
-### C.2 List My Conversations
-
-| | |
-|---|---|
-| **Endpoint Name** | List Conversations |
-| **HTTP Method** | `GET` |
-| **URL Path** | `/api/conversations` |
-| **Purpose** | All conversations for the user with last message + unread count |
-| **Auth Required** | Yes |
-| **Body** | None |
-
-**Success Response — `200 OK`**
-```json
-{
-  "success": true,
-  "message": "Conversations fetched",
-  "data": [
-    {
-      "_id": "6a2776f448722dfdf84de4f7",
-      "type": "direct",
-      "updatedAt": "2026-06-09T02:14:12.653Z",
-      "otherParticipants": [
-        { "_id": "6a2776f348722dfdf84de4f1", "name": "Bob", "avatar": "", "isOnline": false }
-      ],
-      "lastMessage": {
-        "_id": "6a2776f448722dfdf84de4fa",
-        "content": "Hello Bob!",
-        "type": "text",
-        "sender": "6a2776dc48722dfdf84de4e8",
-        "createdAt": "2026-06-09T02:14:12.652Z"
-      },
-      "unreadCount": 0
-    }
-  ]
-}
-```
-
-**Error Responses:** `401`.
-
-**Notes / Business Rules**
-- Built from a **single aggregation pipeline** (joins last message + other participants, computes
-  unread per conversation), sorted by `updatedAt` desc.
-- Result is **cached per user** (TTL 30s) and invalidated whenever a message is sent in any of the
-  user's conversations or read state changes.
-- `unreadCount` = messages where `sender ≠ me` and `me ∉ readBy` (excludes deleted).
-
----
-
-### C.3 Get Conversation Details
-
-| | |
-|---|---|
-| **Endpoint Name** | Get Conversation |
-| **HTTP Method** | `GET` |
-| **URL Path** | `/api/conversations/:id` |
-| **Purpose** | Full conversation with populated participants |
-| **Auth Required** | Yes |
-
-**Path Parameters**
-
-| Param | Type | Required | Rules |
-|-------|------|----------|-------|
-| `id` | string | yes | Valid ObjectId |
-
-**Success Response — `200 OK`**
-```json
-{
-  "success": true,
-  "message": "Conversation fetched",
-  "data": {
-    "_id": "6a2776f448722dfdf84de4f7",
-    "type": "direct",
-    "participants": [
-      { "_id": "6a2776dc48722dfdf84de4e8", "name": "Alice", "avatar": "", "isOnline": true,  "lastSeen": null },
-      { "_id": "6a2776f348722dfdf84de4f1", "name": "Bob",   "avatar": "", "isOnline": false, "lastSeen": "2026-06-09T02:09:00.000Z" }
-    ],
-    "createdBy": "6a2776dc48722dfdf84de4e8",
-    "lastMessage": "6a2776f448722dfdf84de4fa",
-    "createdAt": "2026-06-09T02:14:12.493Z",
-    "updatedAt": "2026-06-09T02:14:12.653Z",
-    "__v": 0
-  }
-}
-```
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `401` | Not authenticated |
-| `403` | Requester is not a participant |
-| `404` | Conversation not found |
-| `422` | Invalid id |
-
----
-
-### C.4 Delete / Leave Conversation
-
-| | |
-|---|---|
-| **Endpoint Name** | Delete / Leave Conversation |
-| **HTTP Method** | `DELETE` |
-| **URL Path** | `/api/conversations/:id` |
-| **Purpose** | Leave a group, or delete a direct conversation |
-| **Auth Required** | Yes |
-
-**Path Parameters**
-
-| Param | Type | Required | Rules |
-|-------|------|----------|-------|
-| `id` | string | yes | Valid ObjectId |
-
-**Success Response — `200 OK`**
-```json
-{ "success": true, "message": "Conversation removed", "data": null }
-```
-
-**Error Responses:** `401`, `403` (not a participant), `404`, `422`.
-
-**Notes / Business Rules**
-- **Group:** removes the requester from `participants`; if it becomes empty the conversation is deleted.
-- **Direct:** deletes the conversation entirely.
-- Invalidates the cached conversation lists of all (former) participants.
+### C.4 Other actions
+| Method | Path | Effect |
+|--------|------|--------|
+| DELETE | `/:conversationId` | **group** → leave (deleted once empty); **direct** → delete outright. |
+| POST | `/:conversationId/clear` | Clear history **for you only** (others keep theirs). Hides messages older than now in your fetches. |
+| POST | `/:conversationId/mute` | `{ muted: true }` — suppresses your offline email/push/bell for this chat. |
+| POST | `/:conversationId/unmute` | `{ muted: false }`. |
 
 ---
 
 ## Section D — Messages (`/api/messages`)
 
-> **All endpoints require authentication.** Sending a message also drives the real-time layer
-> (see §11) and the notification queue (see §12).
+> All require auth. Sending also drives the real-time layer (§11) and the notification queue.
 
-### D.1 Send Message
+### D.1 Send — `POST /`
+Two content types:
+- **Text (JSON):** `{ conversationId, content, type? }` (`type`: `text` default).
+- **Image/File (multipart):** a `file` part (image or PDF, ≤10MB) + `conversationId` + optional `caption`. The backend verifies, uploads to Cloudinary, and derives `type` = `image`|`file`.
 
-| | |
-|---|---|
-| **Endpoint Name** | Send Message |
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/messages` |
-| **Purpose** | Create a message in a conversation (text **or** a file attachment) |
-| **Auth Required** | Yes |
-
-This endpoint accepts **two content types**:
-
-- **`application/json`** — a text message (original behavior, unchanged).
-- **`multipart/form-data`** — a file message (PDF or image) sent into the conversation. It is delivered to the other participant(s) exactly like a text message (same `lastMessage` update, cache invalidation, `message:new` emit, and offline email/push).
-
-**Variant 1 — JSON text message (`Content-Type: application/json`)**
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `conversationId` | string | yes | Readable id `CVE-XXXXXX`; requester must be a participant |
-| `content` | string | yes | Non-empty |
-| `type` | string | no | `text` (default), `image`, or `file` |
-
-**Variant 2 — File message (`Content-Type: multipart/form-data`)**
-
-| Field | Type | Required | Rules |
-|-------|------|----------|-------|
-| `file` | file | yes | The binary part. PDF or image (`jpeg`, `png`, `webp`, `gif`), **≤ 10 MB**. Held in memory (multer `memoryStorage`) and streamed to Cloudinary — never written to disk. The real byte signature is re-verified (magic bytes), so a spoofed extension/mimetype is rejected. |
-| `conversationId` | string | yes | Readable id `CVE-XXXXXX`; requester must be a participant |
-| `caption` | string | no | Optional caption shown with the file (≤ 1000 chars) |
-
-For a file message the server sets `type` automatically (`image` for images, `file` for PDFs) and stores the returned secure URL as `content`; the original name, mime type, size and optional caption are saved under `attachment`.
-
-**Success Response — `201 Created`** (text message)
+Blocked direct chat → `403`. Returns the **message** shape:
 ```json
-{
-  "success": true,
-  "message": "Message sent",
-  "data": {
-    "messageId": "MSG-A1B2C3",
-    "conversationId": "CVE-9F8E7D",
-    "sender": "USR-4D5E6F",
-    "content": "Hello Bob!",
-    "type": "text",
-    "readBy": ["USR-4D5E6F"],
-    "isDeleted": false,
-    "createdAt": "2026-06-09T02:14:12.652Z"
-  }
-}
+{ "messageId": "MSG-…", "conversationId": "CVE-…", "sender": "USR-…",
+  "content": "Hello", "type": "text", "readBy": ["USR-…"], "isDeleted": false,
+  "createdAt": "…", "attachment": { "originalName": "f.pdf", "mimeType": "application/pdf", "size": 1234, "caption": "…" } }
 ```
+(`attachment` present only for image/file messages.)
 
-**Success Response — `201 Created`** (file message; `message` is `"File sent"`)
-```json
-{
-  "success": true,
-  "message": "File sent",
-  "data": {
-    "messageId": "MSG-7H8I9J",
-    "conversationId": "CVE-9F8E7D",
-    "sender": "USR-4D5E6F",
-    "content": "https://res.cloudinary.com/<cloud>/raw/upload/v1/chatloop/messages/abc123.pdf",
-    "type": "file",
-    "readBy": ["USR-4D5E6F"],
-    "isDeleted": false,
-    "createdAt": "2026-06-09T02:14:12.652Z",
-    "attachment": {
-      "originalName": "invoice.pdf",
-      "mimeType": "application/pdf",
-      "size": 824133,
-      "caption": "Here's the invoice"
-    }
-  }
-}
-```
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `401` | Not authenticated |
-| `403` | Not a participant of the conversation |
-| `404` | Conversation not found |
-| `413` | File exceeds 10MB (`LIMIT_FILE_SIZE`) |
-| `415` | Disallowed or spoofed file type (only PDF + `jpeg`/`png`/`webp`/`gif`) |
-| `422` | Validation failed (e.g. missing `conversationId`, or empty `content` on a text message) |
-
-**Notes / Business Rules**
-- **Text message:** send `application/json` with `content`. **File message:** send `multipart/form-data` with a `file` part (+ `conversationId`, optional `caption`); the server uploads it and stores the resulting secure URL as `content`, with metadata under `attachment`.
-- File handling: multer `memoryStorage()` keeps the upload as an in-memory Buffer (no disk writes), capped at 10MB; the buffer is streamed to Cloudinary via `upload_stream` (`resource_type: "image"` for images, `"raw"` for PDFs). The true type is verified from the file's magic bytes — the declared mimetype/extension alone is not trusted.
-- Side effects are **identical** for text and file messages: updates `conversation.lastMessage`, invalidates participants' conversation-list caches, emits `message:new` to each other participant's user room, and **enqueues** an offline email + push/bell notification for participants who are currently offline (respecting per-chat mute).
-- The sender is automatically added to `readBy`.
-- Prefer upload-then-send? Use **`POST /api/uploads`** (§17) to store the file first, then send a normal JSON message with `type: "image" | "file"` and `content` set to the returned URL.
+### D.2 Other actions
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/:conversationId?cursor=&limit=` | History, newest-first, cursor-paginated (`limit` 1–100, default 20). Returns `{ items[], nextCursor }`. Excludes soft-deleted, messages you "deleted for me", and (per "clear chat") anything older than your `clearedAt`. |
+| POST | `/:conversationId/read` | Mark all unread read → `{ modified }`. |
+| PATCH | `/:messageId/read` | Mark one read (idempotent). Emits `message:read`. |
+| DELETE | `/:messageId?scope=me\|everyone` | `me` hides it for you; `everyone` (default) soft-deletes for all — **sender only, within `DELETE_FOR_EVERYONE_WINDOW_SECONDS`** (else `403`/`400`). |
 
 ---
 
-### D.2 Get Message History (Cursor Paginated)
+## Section E — Status / Stories (`/api/status`)
 
-| | |
-|---|---|
-| **Endpoint Name** | Get Messages |
-| **HTTP Method** | `GET` |
-| **URL Path** | `/api/messages/:conversationId` |
-| **Purpose** | Paginated message history, newest first |
-| **Auth Required** | Yes |
+> All require auth. Ephemeral photo/video/text that auto-expires after 24h (Mongo TTL index).
+> Visibility = your **contacts** (users you share a conversation with) + yourself.
 
-**Path Parameters**
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/` | **media**: multipart `media` (image/video) + `caption?`; **or text**: JSON `{ text, bgColor?, caption? }` (`bgColor` hex). One of media/text required. → status. |
+| GET | `/feed` | Active statuses grouped by author, your own first, then unseen. Array of `{ user, isMine, statuses[], hasUnseen, lastCreatedAt }`. |
+| GET | `/user/:userId` | One author's active statuses (contacts only) → `{ user, isMine, statuses[] }`. |
+| POST | `/:statusId/view` | Record that you viewed it (idempotent; owner is a no-op). |
+| GET | `/:statusId/viewers` | **Owner only** → `{ count, viewers: [{ userId, name, avatar, isOnline }] }`. |
+| DELETE | `/:statusId` | **Owner only** — also deletes the Cloudinary asset. |
 
-| Param | Type | Required | Rules |
-|-------|------|----------|-------|
-| `conversationId` | string | yes | Valid ObjectId; requester must be a participant |
-
-**Query Parameters**
-
-| Param | Type | Required | Rules |
-|-------|------|----------|-------|
-| `cursor` | string | no | A message ObjectId; returns messages older than it |
-| `limit` | integer | no | 1–100 (default 20) |
-
-**Success Response — `200 OK`**
+**status shape:**
 ```json
-{
-  "success": true,
-  "message": "Messages fetched",
-  "data": {
-    "items": [
-      {
-        "_id": "6a2776f448722dfdf84de4fa",
-        "conversation": "6a2776f448722dfdf84de4f7",
-        "sender": "6a2776dc48722dfdf84de4e8",
-        "content": "Hello Bob!",
-        "type": "text",
-        "readBy": ["6a2776dc48722dfdf84de4e8"],
-        "isDeleted": false,
-        "createdAt": "2026-06-09T02:14:12.652Z",
-        "updatedAt": "2026-06-09T02:14:12.652Z",
-        "__v": 0
-      }
-    ],
-    "nextCursor": null
-  }
-}
+{ "statusId": "STA-…", "type": "image", "mediaUrl": "https://…", "thumbnailUrl": "https://…",
+  "text": "", "bgColor": "#2563EB", "caption": "", "duration": 0,
+  "createdAt": "…", "expiresAt": "…", "viewed": false, "viewersCount": 3 }
 ```
+`type` ∈ `image|video|text`. `viewersCount` present only on your own statuses.
 
-**Error Responses:** `401`, `403`, `404`, `422`.
+---
 
-**Notes / Business Rules**
-- **Cursor-based pagination** (no `skip`/`limit` offset). To load the next page, pass
-  `cursor=<nextCursor>`. When `nextCursor` is `null`, there are no more messages.
-- Soft-deleted messages are excluded.
+## Section F — Calls (`/api/calls`)
 
-**Example Request**
-```bash
-curl "http://localhost:5000/api/messages/6a2776f448722dfdf84de4f7?limit=20" \
-  -H "Authorization: Bearer $TOKEN"
+> All require auth. WebRTC media is peer-to-peer; the **signaling** is socket-only (§11). These
+> REST routes expose history + ICE config.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/?cursor=&limit=` | Call history (newest-first, cursor-paginated) → `{ items[], nextCursor }`. |
+| GET | `/ice-servers` | STUN/TURN config → `{ iceServers: [{ urls, username?, credential? }] }`. |
+| GET | `/:callId` | One call record (participant only). |
+
+**call shape:**
+```json
+{ "callId": "CAL-…", "type": "video", "status": "ended",
+  "caller": { "userId": "USR-…", "name": "Alice", "avatar": "" },
+  "callee": { "userId": "USR-…", "name": "Bob", "avatar": "" },
+  "conversationId": "CVE-…", "startedAt": "…", "answeredAt": "…", "endedAt": "…",
+  "durationSec": 42, "endReason": "hangup", "endedBy": "USR-…", "createdAt": "…" }
 ```
 
 ---
 
-### D.3 Mark One Message Read
+## Section G — Notifications (`/api/notifications`)
 
-| | |
-|---|---|
-| **Endpoint Name** | Mark Message Read |
-| **HTTP Method** | `PATCH` |
-| **URL Path** | `/api/messages/:id/read` |
-| **Purpose** | Add the requester to a message's `readBy` |
-| **Auth Required** | Yes |
+> All require auth.
 
-**Path Parameters**
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/?cursor=&limit=` | In-app notifications, newest-first → `{ items[], nextCursor }`. |
+| GET | `/unread-count` | `{ count }`. |
+| PATCH | `/read-all` | Mark all read → `{ modified }`. |
+| PATCH | `/:notificationId/read` | Mark one read. |
+| DELETE | `/:notificationId` | Remove one. |
+| POST | `/push-tokens` | Body `{ token }` (Expo push token) — register this device. |
+| DELETE | `/push-tokens` | Body `{ token }` — unregister. |
 
-| Param | Type | Required | Rules |
-|-------|------|----------|-------|
-| `id` | string | yes | Valid message ObjectId |
-
-**Success Response — `200 OK`**
+**notification shape:**
 ```json
-{ "success": true, "message": "Message marked read", "data": null }
+{ "notificationId": "NOT-…", "type": "message", "title": "Alice", "body": "Hi",
+  "data": { "conversationId": "CVE-…" }, "isRead": false,
+  "sender": { "userId": "USR-…", "name": "Alice", "avatar": "" }, "createdAt": "…" }
 ```
-
-**Error Responses:** `401`, `403` (not a participant), `404`, `422`.
-
-**Notes / Business Rules**
-- Idempotent (`$addToSet`). Emits `message:read` to all participants' user rooms.
+`type` ∈ `message|call_incoming|call_missed|group_added|new_chat`.
 
 ---
 
-### D.4 Mark Many Read (Bulk)
+## Section H — Admin (`/api/admin`)
 
-| | |
-|---|---|
-| **Endpoint Name** | Mark Conversation Read |
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/messages/:conversationId/read` |
-| **Purpose** | Mark all unread messages in a conversation as read |
-| **Auth Required** | Yes |
+> Require auth **and** the `admin` role (checked against the DB). First admin via `ADMIN_EMAIL`.
 
-**Path Parameters**
-
-| Param | Type | Required | Rules |
-|-------|------|----------|-------|
-| `conversationId` | string | yes | Valid ObjectId; requester must be a participant |
-
-**Success Response — `200 OK`**
-```json
-{ "success": true, "message": "Messages marked read", "data": { "modified": 7 } }
-```
-
-**Error Responses:** `401`, `403`, `404`, `422`.
-
-**Notes / Business Rules**
-- Single `updateMany` over messages where `sender ≠ me` and `me ∉ readBy`.
-- Invalidates the requester's cached conversation list (unread count changes).
-
----
-
-### D.5 Delete Message (Soft Delete)
-
-| | |
-|---|---|
-| **Endpoint Name** | Delete Message |
-| **HTTP Method** | `DELETE` |
-| **URL Path** | `/api/messages/:id` |
-| **Purpose** | Soft-delete a message |
-| **Auth Required** | Yes |
-
-**Path Parameters**
-
-| Param | Type | Required | Rules |
-|-------|------|----------|-------|
-| `id` | string | yes | Valid message ObjectId |
-
-**Success Response — `200 OK`**
-```json
-{ "success": true, "message": "Message deleted", "data": null }
-```
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `401` | Not authenticated |
-| `403` | Only the sender may delete the message |
-| `404` | Message not found |
-| `422` | Invalid id |
-
-**Notes / Business Rules**
-- Sets `isDeleted: true` and clears `content` (soft delete). A daily cron hard-deletes messages
-  soft-deleted more than 30 days ago.
-
----
-
-## Section E — Notifications
-
-There is **no REST endpoint** for notifications. Notifications are delivered two ways:
-
-1. **Real-time (in-app)** via Socket.io events (see §11) — `message:new`, `message:read`,
-   `typing:*`, `user:status`.
-2. **Out-of-band** via a **BullMQ `notifications` queue**. When a message is sent, an email
-   notification job is enqueued for any participant who is currently **offline** (presence is
-   tracked in Redis). A background worker sends the emails via SMTP. OTP emails use the same queue.
-
-| Aspect | Detail |
-|--------|--------|
-| Queue name | `notifications` |
-| Job types | `otp-email`, `new-message` |
-| Producer | Controllers/handlers enqueue only (never block on sending) |
-| Consumer | Worker with concurrency 10; retries 3× with exponential backoff |
-| Trigger (`new-message`) | Recipient is offline at send time |
-
-> To expose a notification **history/read** API (e.g. `GET /api/notifications`), a `Notification`
-> model and routes would need to be added — not present in the current version.
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/stats` | `{ users{total,verified,admins,onlineNow}, conversations{total,direct,group}, messages{total,today,week}, timeSeries{signupsPerDay[],messagesPerDay[]} }`. |
+| GET | `/users?search=&filter=&sort=&page=&limit=` | Paginated. `filter` ∈ verified/unverified/online/admin/user/active/banned; `sort` ∈ newest/oldest/name. → `{ items[], page, limit, total, totalPages }`. |
+| PATCH | `/users/:userId` | Body any of `{ role, isVerified, isVerifiedAccount, isActive }`. Can't demote/suspend yourself. Banning revokes sessions. |
+| DELETE | `/users/:userId` | Removes the user + their messages, prunes conversations. |
+| GET | `/conversations?page=&limit=` | Paginated, with participant previews + message counts. |
+| DELETE | `/conversations/:conversationId` | Delete a conversation + its messages. |
+| GET | `/messages?conversationId=&senderId=&page=&limit=` | Moderation list. |
+| DELETE | `/messages/:messageId` | Soft-delete (sets `isDeleted`, clears content). |
+| GET | `/reports?status=&page=&limit=` | User-report queue (`status` ∈ open/reviewed/dismissed). Items resolve `reporter`/`reported` to `{ userId, name, avatar }`. |
+| PATCH | `/reports/:reportId` | Body `{ status }` (open/reviewed/dismissed). |
 
 ---
 
 ## 11. Real-time API (Socket.io)
 
-**Connect** (token in the handshake):
+Connect (token in handshake; web uses the cookie):
 ```js
-import { io } from "socket.io-client";
 const socket = io("http://localhost:5000", { auth: { token: accessToken } });
 ```
-Invalid/missing token → `connect_error` with message `Invalid or expired token` /
-`Authentication token missing`. On connect, the socket auto-joins a room named after its `userId`;
-all targeted delivery uses these per-user rooms (no global broadcasts). Multi-instance fan-out is
-handled by the Redis adapter.
+On connect the socket joins a private room named after the user's **`userId`** — all targeted
+delivery uses these per-user rooms (multi-instance fan-out via the Redis adapter).
 
 **Client → Server**
 
-| Event | Payload | Ack callback | Description |
-|-------|---------|--------------|-------------|
-| `message:send` | `{ conversationId, content, type? }` | `{ success, message }` or `{ success:false, error }` | Persist + dispatch a message; ack returns the saved message so the client need not re-fetch |
-| `message:read` | `{ messageId }` | — | Mark a message read; re-broadcast to participants |
-| `typing:start` | `{ conversationId }` | — | Indicate typing (server-throttled to ~once/2s per user/conversation) |
-| `typing:stop` | `{ conversationId }` | — | Stop typing |
+| Event | Payload | Ack |
+|-------|---------|-----|
+| `message:send` | `{ conversationId, content, type? }` | `{ success, message }` / `{ success:false, error }` |
+| `message:read` | `{ messageId }` | — |
+| `typing:start` / `typing:stop` | `{ conversationId }` | — |
+| `call:initiate` | `{ calleeId, type, conversationId? }` | `{ success, callId }` / busy/error |
+| `call:accept` / `call:reject` / `call:end` | `{ callId }` | `{ success }` |
+| `call:offer` / `call:answer` | `{ callId, sdp }` | `{ success }` |
+| `call:ice-candidate` | `{ callId, candidate }` | `{ success }` |
+| `call:ice-servers` | — | `{ success, iceServers }` |
 
 **Server → Client**
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `message:new` | the saved message object | Delivered to each *other* participant's room |
-| `message:read` | `{ messageId, conversationId, userId }` | A participant read a message |
-| `typing:start` | `{ conversationId, userId }` | A participant started typing |
-| `typing:stop` | `{ conversationId, userId }` | A participant stopped typing |
-| `user:status` | `{ userId, isOnline, lastSeen? }` | Presence change (broadcast on connect/disconnect) |
-
-**Example**
-```js
-socket.emit("message:send", { conversationId, content: "hi" }, (ack) => {
-  if (ack.success) console.log("saved", ack.message._id);
-});
-socket.on("message:new", (msg) => addToUI(msg));
-socket.on("user:status", (s) => updatePresence(s));
-```
+| Event | Payload |
+|-------|---------|
+| `message:new` | the saved message |
+| `message:read` | `{ messageId, conversationId, userId }` |
+| `typing:start` / `typing:stop` | `{ conversationId, userId }` |
+| `user:status` | `{ userId, isOnline, lastSeen? }` |
+| `notification:new` | the notification (often with `unreadCount`) |
+| `story:new` | `{ status, author }` — a contact posted a status |
+| `story:viewed` | `{ statusId, viewerId, viewersCount }` — to the owner |
+| `call:incoming` | `{ callId, type, caller }` |
+| `call:accepted` / `call:rejected` / `call:ended` / `call:missed` / `call:busy` / `call:error` | call lifecycle |
+| `call:offer` / `call:answer` / `call:ice-candidate` | relayed WebRTC signaling |
 
 ---
 
-## 15. Events
+## 12. Appendix — Endpoint Index
 
-**Not implemented.** There is no "Events" resource/model or endpoints in the current backend.
-(If "events" refers to real-time events, see the Socket.io contract in §11.)
-
-## 16. Admin
-
-**Not implemented.** There are no admin endpoints, no roles beyond a single `user`, and no
-admin authorization layer in the current version. Adding this would require a role field on the
-User model, role-aware middleware, and an `/api/admin/*` router.
-
-## 17. File Uploads
-
-Files are uploaded through the API using a **buffer + stream** pipeline: `multipart/form-data` →
-in-memory Buffer (multer `memoryStorage()`, no disk writes) → streamed to Cloudinary via
-`upload_stream`. Allowed types are **PDF** and images (`jpeg`, `png`, `webp`, `gif`), max **10 MB**.
-The real type is verified from the file's magic bytes (not the declared mimetype/extension), and a
-declared type that doesn't match the bytes is rejected. Requires `CLOUDINARY_CLOUD_NAME`,
-`CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`.
-
-There are **two ways** to send a file:
-
-1. **Send directly as a message** — `POST /api/messages` with `multipart/form-data` (see **D.1**,
-   Variant 2). One request: upload + create + deliver the message.
-
-2. **Upload then send** — `POST /api/uploads` stores the file and returns its descriptor; the client
-   then sends a normal JSON message referencing the URL.
-
-### 17.1 Upload a File (standalone)
-
-| | |
-|---|---|
-| **HTTP Method** | `POST` |
-| **URL Path** | `/api/uploads` |
-| **Purpose** | Run the verify + stream pipeline and return the stored asset |
-| **Auth Required** | Yes |
-| **Content-Type** | `multipart/form-data` |
-
-**Request** — a single `file` part (PDF or image, ≤ 10 MB).
-
-**Success Response — `201 Created`**
-```json
-{
-  "success": true,
-  "message": "File uploaded",
-  "data": {
-    "url": "https://res.cloudinary.com/<cloud>/image/upload/v1/chatloop/messages/abc123.png",
-    "type": "image",
-    "mimeType": "image/png",
-    "size": 51234,
-    "originalName": "screenshot.png"
-  }
-}
-```
-
-**Error Responses**
-
-| Status | Reason |
-|--------|--------|
-| `400` | No `file` part provided |
-| `401` | Not authenticated |
-| `413` | File exceeds 10MB |
-| `415` | Disallowed or spoofed file type |
-
-**Next step:** send the returned `url` as a message — `POST /api/messages` (JSON) with
-`{ "conversationId": "CVE-…", "content": "<url>", "type": "image" | "file" }`.
-
----
-
-## 18. Postman Collection Structure
-
-Suggested collection layout. Create a **Collection** named **"Chat Application API"** with a
-collection variable `baseUrl = http://localhost:5000` and `accessToken` (set automatically — see below).
-
-```
-Chat Application API/
-├── Authentication/
-│   ├── Register                  POST   {{baseUrl}}/api/auth/register
-│   ├── Verify OTP                POST   {{baseUrl}}/api/auth/verify-otp
-│   ├── Resend OTP                POST   {{baseUrl}}/api/auth/resend-otp
-│   ├── Login                     POST   {{baseUrl}}/api/auth/login
-│   ├── Refresh Token             POST   {{baseUrl}}/api/auth/refresh
-│   └── Logout                    POST   {{baseUrl}}/api/auth/logout
-├── Users/
-│   ├── Get My Profile            GET    {{baseUrl}}/api/users/me
-│   ├── Update My Profile         PATCH  {{baseUrl}}/api/users/me
-│   ├── Search Users              GET    {{baseUrl}}/api/users/search?q=
-│   └── Get User By ID            GET    {{baseUrl}}/api/users/:id
-├── Chats (Conversations)/
-│   ├── Create / Fetch            POST   {{baseUrl}}/api/conversations
-│   ├── List Conversations        GET    {{baseUrl}}/api/conversations
-│   ├── Get Conversation          GET    {{baseUrl}}/api/conversations/:id
-│   └── Delete / Leave            DELETE {{baseUrl}}/api/conversations/:id
-├── Messages/
-│   ├── Send Message (text)       POST   {{baseUrl}}/api/messages          (application/json)
-│   ├── Send File (PDF/image)     POST   {{baseUrl}}/api/messages          (multipart/form-data: file, conversationId, caption?)
-│   ├── Get History               GET    {{baseUrl}}/api/messages/:conversationId?limit=20
-│   ├── Mark One Read             PATCH  {{baseUrl}}/api/messages/:id/read
-│   ├── Mark Conversation Read    POST   {{baseUrl}}/api/messages/:conversationId/read
-│   └── Delete Message            DELETE {{baseUrl}}/api/messages/:id
-├── Uploads/
-│   └── Upload File (standalone)  POST   {{baseUrl}}/api/uploads           (multipart/form-data: file)
-└── (Health)
-    └── Health Check              GET    {{baseUrl}}/health
-```
-
-**Collection-level settings**
-- **Authorization:** set the collection auth to **Bearer Token** = `{{accessToken}}`; child requests
-  inherit it. The Authentication folder requests override auth to **No Auth**.
-- **Variables:** `baseUrl`, `accessToken`, `refreshToken`, plus convenience ids
-  (`userId`, `conversationId`, `messageId`).
-- **Login "Tests" script** (auto-capture tokens):
-  ```js
-  const json = pm.response.json();
-  if (json?.data?.accessToken) {
-    pm.collectionVariables.set("accessToken", json.data.accessToken);
-    pm.collectionVariables.set("refreshToken", json.data.refreshToken);
-  }
-  ```
-- **Sections not in the API** (Events, Admin, File Uploads, Notifications REST) are intentionally
-  omitted from the collection because they have no endpoints — see §5/§15–17.
-
----
-
-## Appendix — Endpoint Index
-
-| # | Method | Path | Auth | Section |
-|---|--------|------|------|---------|
-| 1 | POST | `/api/auth/register` | No | Authentication |
-| 2 | POST | `/api/auth/verify-otp` | No | Authentication |
-| 3 | POST | `/api/auth/resend-otp` | No | Authentication |
-| 4 | POST | `/api/auth/login` | No | Authentication |
-| 5 | POST | `/api/auth/refresh` | No | Authentication |
-| 6 | POST | `/api/auth/logout` | No | Authentication |
-| 7 | GET | `/api/users/me` | Yes | Users |
-| 8 | PATCH | `/api/users/me` | Yes | Users |
-| 9 | GET | `/api/users/search?q=` | Yes | Users |
-| 10 | GET | `/api/users/:id` | Yes | Users |
-| 11 | POST | `/api/conversations` | Yes | Chats |
-| 12 | GET | `/api/conversations` | Yes | Chats |
-| 13 | GET | `/api/conversations/:id` | Yes | Chats |
-| 14 | DELETE | `/api/conversations/:id` | Yes | Chats |
-| 15 | POST | `/api/messages` | Yes | Messages |
-| 16 | GET | `/api/messages/:conversationId` | Yes | Messages |
-| 17 | PATCH | `/api/messages/:id/read` | Yes | Messages |
-| 18 | POST | `/api/messages/:conversationId/read` | Yes | Messages |
-| 19 | DELETE | `/api/messages/:id` | Yes | Messages |
-| — | GET | `/health` | No | Health |
+| Method | Path | Auth |
+|--------|------|------|
+| POST | `/api/auth/register` · `/verify-otp` · `/resend-otp` · `/login` · `/refresh` · `/logout` · `/forgot-password` · `/reset-password` | No |
+| GET/PATCH | `/api/users/me` | Yes |
+| POST | `/api/users/me/avatar` | Yes |
+| GET | `/api/users/search` · `/blocked` · `/:userId` | Yes |
+| POST | `/api/users/block/:userId` · `/unblock/:userId` · `/report/:userId` | Yes |
+| POST/GET | `/api/conversations` | Yes |
+| GET/DELETE | `/api/conversations/:conversationId` | Yes |
+| POST | `/api/conversations/:conversationId/clear` · `/mute` · `/unmute` | Yes |
+| POST | `/api/messages` | Yes |
+| GET | `/api/messages/:conversationId` | Yes |
+| POST | `/api/messages/:conversationId/read` | Yes |
+| PATCH/DELETE | `/api/messages/:messageId/read` · `/api/messages/:messageId` | Yes |
+| POST/GET | `/api/status` · `/api/status/feed` | Yes |
+| GET | `/api/status/user/:userId` · `/api/status/:statusId/viewers` | Yes |
+| POST/DELETE | `/api/status/:statusId/view` · `/api/status/:statusId` | Yes |
+| GET | `/api/calls` · `/api/calls/ice-servers` · `/api/calls/:callId` | Yes |
+| GET | `/api/notifications` · `/unread-count` | Yes |
+| PATCH | `/api/notifications/read-all` · `/:notificationId/read` | Yes |
+| DELETE | `/api/notifications/:notificationId` | Yes |
+| POST/DELETE | `/api/notifications/push-tokens` | Yes |
+| GET | `/api/admin/stats` · `/users` · `/conversations` · `/messages` · `/reports` | Admin |
+| PATCH | `/api/admin/users/:userId` · `/reports/:reportId` | Admin |
+| DELETE | `/api/admin/users/:userId` · `/conversations/:conversationId` · `/messages/:messageId` | Admin |
+| GET | `/health` | No |
